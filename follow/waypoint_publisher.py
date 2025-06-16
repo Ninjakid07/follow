@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 
 import rclpy
+import math
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from nav_msgs.msg import Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Quaternion
 
 class WaypointPublisher(Node):
     def __init__(self):
         super().__init__('waypoint_publisher_node')
 
-        # SET YOUR WAYPOINT COORDINATES (X, Y) HERE
+        # Helper function to convert yaw angle (in radians) to a quaternion
+        def create_quaternion_from_yaw(yaw):
+            return Quaternion(
+                x=0.0,
+                y=0.0,
+                z=math.sin(yaw / 2.0),
+                w=math.cos(yaw / 2.0)
+            )
+
+        # SET YOUR WAYPOINT COORDINATES (X, Y, YAW in radians) HERE
+        # Yaw: 0 is forward (X-axis), pi/2 is left (Y-axis), pi is backward (-X axis)
         self.waypoints = [
-            (0.0, 0.0),
-            (0.3, 0.0),
-            (0.6, 0.0),
-            (0.9, 0.0),
-            (1.0, 0.0)
+            # Start at (0,0) facing forward (0 rad yaw)
+            (0.0, 0.0, 0.0),
+            # Waypoint at (1.0, 0.0), but set orientation for the *next* segment (90-deg left turn)
+            (1.0, 0.0, math.pi / 2.0),
+            # Waypoint at (1.0, 0.5), set orientation for the *next* segment (another 90-deg left turn)
+            (1.0, 0.5, math.pi),
+            # Final waypoint at (0.0, 0.5), facing backward
+            (0.0, 0.5, math.pi)
         ]
 
         qos_profile = QoSProfile(
@@ -42,10 +56,7 @@ class WaypointPublisher(Node):
             pose.pose.position.y = float(point[1])
             pose.pose.position.z = 0.0
 
-            pose.pose.orientation.w = 1.0
-            pose.pose.orientation.x = 0.0
-            pose.pose.orientation.y = 0.0
-            pose.pose.orientation.z = 0.0
+            pose.pose.orientation = create_quaternion_from_yaw(point[2])
 
             self.path_msg.poses.append(pose)
 
@@ -55,7 +66,7 @@ class WaypointPublisher(Node):
     def publish_path(self):
         self.path_msg.header.stamp = self.get_clock().now().to_msg()
         self.path_publisher.publish(self.path_msg)
-        self.get_logger().info("Publishing path to '/path' topic...")
+        self.get_logger().info("Publishing U-shaped path to '/path' topic...")
 
 
 def main(args=None):
