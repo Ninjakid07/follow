@@ -2,7 +2,7 @@
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CompressedImage
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
@@ -35,7 +35,7 @@ MAX_HORIZONTAL_DEVIATION_PX = 50 # Max horizontal pixel distance between the cen
 MAX_VERTICAL_GAP_RATIO = 2.0     # The gap between stripes can't be larger than 2.0x the height of a stripe.
                                  # This allows for the white stripes between the red ones.
 MIN_STRIPES_IN_GROUP = 3         # A valid cylinder must have at least 3 red stripes.
-                                 # Your image shows 6, so 3 is a robust minimum for partial views.
+                                 # Based on your image, 3 is a robust minimum for partial views.
 
 # =====================================================================================
 
@@ -44,19 +44,24 @@ class HorizontalCylinderDetector(Node):
         super().__init__('horizontal_cylinder_detector')
         self.bridge = CvBridge()
 
+        # Correctly subscribe to the compressed, rectified image topic from the OAK-D camera
         self.image_sub = self.create_subscription(
-            Image,
-            '/camera/color/image_raw',
+            CompressedImage,
+            '/oak/rgb/image_rect/compressed',
             self.image_callback,
             10)
         
+        # Publishers for debugging in RViz
         self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 10)
+        self.mask_image_pub = self.create_publisher(Image, '~/red_mask', 10)
 
         self.get_logger().info('Horizontal Cylinder Detector has started.')
+        self.get_logger().info('Subscribed to /oak/rgb/image_rect/compressed')
 
     def image_callback(self, msg):
         try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+            # Convert the compressed ROS Image message to an OpenCV image
+            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
             hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
         except Exception as e:
             self.get_logger().error(f'Failed to convert image: {e}')
@@ -66,6 +71,7 @@ class HorizontalCylinderDetector(Node):
         mask1 = cv2.inRange(hsv_image, LOWER_RED_1, UPPER_RED_1)
         mask2 = cv2.inRange(hsv_image, LOWER_RED_2, UPPER_RED_2)
         mask = cv2.bitwise_or(mask1, mask2)
+        # Clean up the mask using morphological operations
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5,5),np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5),np.uint8))
 
@@ -79,13 +85,12 @@ class HorizontalCylinderDetector(Node):
                 continue
 
             x, y, w, h = cv2.boundingRect(c)
-            # Avoid division by zero
             if h == 0: continue
             
             aspect_ratio = w / float(h)
 
             if aspect_ratio > MIN_ASPECT_RATIO:
-                # Store stripe info for easier processing
+                # Get the center x-coordinate for alignment checks
                 M = cv2.moments(c)
                 cx = int(M['m10']/M['m00']) if M['m00'] != 0 else x + w/2
                 valid_stripes.append({'contour': c, 'x': x, 'y': y, 'w': w, 'h': h, 'cx': cx})
@@ -96,18 +101,12 @@ class HorizontalCylinderDetector(Node):
         # Step 4: Group stripes into cylinders
         detected_cylinders = []
         while len(valid_stripes) > 0:
-            # Start a new potential cylinder group with the top-most remaining stripe
             base_stripe = valid_stripes.pop(0)
             current_group = [base_stripe]
-            
-            # This list will hold stripes that don't belong to the current group
             other_stripes = []
             
             for stripe in valid_stripes:
-                # Check for horizontal alignment and vertical stacking relative to the base
                 is_aligned = abs(stripe['cx'] - base_stripe['cx']) < MAX_HORIZONTAL_DEVIATION_PX
-                
-                # Check if the gap between the last stripe in the group and the new one is reasonable
                 last_in_group = current_group[-1]
                 gap = stripe['y'] - (last_in_group['y'] + last_in_group['h'])
                 is_stacked = 0 < gap < (MAX_VERTICAL_GAP_RATIO * last_in_group['h'])
@@ -130,16 +129,18 @@ class HorizontalCylinderDetector(Node):
         for i, cylinder_group in enumerate(detected_cylinders):
             all_points = np.vstack([s['contour'] for s in cylinder_group])
             x, y, w, h = cv2.boundingRect(all_points)
-            cv2.rectangle(debug_image, (x, y), (x + w, y + h), (36, 255, 12), 3) # Green box
+            cv2.rectangle(debug_image, (x, y), (x + w, y + h), (36, 255, 12), 3)
             label = f"Cylinder {i+1}"
             cv2.putText(debug_image, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
 
-        # Publish and display debug images
+        # Publish debug images for RViz
         try:
             self.debug_image_pub.publish(self.bridge.cv2_to_imgmsg(debug_image, 'bgr8'))
+            self.mask_image_pub.publish(self.bridge.cv2_to_imgmsg(mask, 'mono8'))
         except Exception as e:
             self.get_logger().error(f'Failed to publish debug image: {e}')
 
+        # Display locally if you have a screen connected
         cv2.imshow("Detection Result", debug_image)
         cv2.imshow("Red Mask", mask)
         cv2.waitKey(1)
