@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'waypoint_publisher = follow.waypoint_publisher:main',
             'path_follower = follow.path_follower:main',
+            'cylinder_detector = follow.horizontal_cylinder_detector:main',
         ],
     },
 )
