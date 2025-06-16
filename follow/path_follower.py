@@ -17,17 +17,22 @@ class PathFollower(Node):
         self.current_waypoint_index = 0
         self.is_navigating = False
 
+        self._action_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+
+        self.get_logger().info('Path follower node has been initialized.')
+        
+        self.get_logger().info('Waiting for NavigateToPose action server...')
+        self._action_client.wait_for_server()
+        self.get_logger().info('Action server is available.')
+
         self.path_subscriber = self.create_subscription(
             Path,
             '/path',
             self.path_callback,
             10
         )
-
-        self._action_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
-
-        self.get_logger().info('Path follower node has been initialized.')
         self.get_logger().info('Waiting for a path on the /path topic...')
+
 
     def path_callback(self, msg: Path):
         if self.is_navigating:
@@ -57,11 +62,11 @@ class PathFollower(Node):
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = target_pose
-
-        if not self._action_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error('NavigateToPose action server not available. Aborting.')
-            self.is_navigating = False
-            return
+        
+        if not self._action_client.wait_for_server(timeout_sec=1.0):
+             self.get_logger().error('NavigateToPose action server disappeared. Aborting.')
+             self.is_navigating = False
+             return
 
         self.get_logger().info(f'Sending waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} as goal.')
 
