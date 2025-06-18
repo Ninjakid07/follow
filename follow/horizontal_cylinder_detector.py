@@ -40,6 +40,13 @@ MAX_DEFECT_ANGLE_DEG = 90
 class HorizontalCylinderDetector(Node):
     def __init__(self):
         super().__init__('horizontal_cylinder_detector')
+        
+        # Declare parameters
+        self.declare_parameter('target_frame', 'map')
+        self.declare_parameter('fallback_frame', 'odom')
+        self.declare_parameter('use_fallback', True)
+        self.declare_parameter('camera_frame', 'oak_camera_rgb_camera_optical_frame')
+        
         self.bridge = CvBridge()
         self.latest_depth_image = None
         
@@ -50,13 +57,22 @@ class HorizontalCylinderDetector(Node):
         self.cx = None
         self.cy = None
         
-        # TF2 setup
+        # TF2 setup with longer buffer time
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
-        # Frame names
-        self.camera_frame = 'oak_camera_rgb_camera_optical_frame'
-        self.map_frame = 'map'
+        # Give TF buffer time to fill
+        self.tf_buffer_duration = rclpy.duration.Duration(seconds=10.0)
+        
+        # Frame names from parameters
+        self.camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
+        self.map_frame = self.get_parameter('target_frame').get_parameter_value().string_value
+        self.fallback_frame = self.get_parameter('fallback_frame').get_parameter_value().string_value
+        self.use_fallback = self.get_parameter('use_fallback').get_parameter_value().bool_value
+        
+        # Track if we've successfully transformed before
+        self.transform_available = False
+        self.using_fallback = False
 
         # Subscribers
         self.image_sub = self.create_subscription(
@@ -86,6 +102,11 @@ class HorizontalCylinderDetector(Node):
         self.get_logger().info('Cylinder Detector (Contour Splitting) has started.')
         self.get_logger().info('Waiting for camera intrinsics...')
         self.get_logger().info(f'Will transform from {self.camera_frame} to {self.map_frame}')
+        if self.use_fallback:
+            self.get_logger().info(f'  (Will use {self.fallback_frame} frame as fallback if {self.map_frame} is not available)')
+        
+        # Create a timer to check TF availability
+        self.create_timer(2.0, self.check_tf_availability)
 
     def camera_info_callback(self, msg):
         """Extract camera intrinsics from CameraInfo message"""
@@ -106,6 +127,32 @@ class HorizontalCylinderDetector(Node):
             self.get_logger().info(f'Camera intrinsics received:')
             self.get_logger().info(f'  fx: {self.fx:.2f}, fy: {self.fy:.2f}')
             self.get_logger().info(f'  cx: {self.cx:.2f}, cy: {self.cy:.2f}')
+    
+    def check_tf_availability(self):
+        """Periodically check if required transforms are available"""
+        try:
+            # Check if we can get the transform to map
+            if self.tf_buffer.can_transform(self.map_frame, self.camera_frame, rclpy.time.Time()):
+                if not self.transform_available or self.using_fallback:
+                    self.get_logger().info('✓ Transform chain to map frame is available!')
+                    self.get_logger().info(f'  {self.camera_frame} → ... → {self.map_frame}')
+                    if self.using_fallback:
+                        self.get_logger().info('  Switching from odom to map frame')
+                        self.using_fallback = False
+            # Check if we can at least get to odom
+            elif self.use_fallback and self.tf_buffer.can_transform(self.fallback_frame, self.camera_frame, rclpy.time.Time()):
+                if not self.transform_available:
+                    self.get_logger().info('✓ Transform chain to odom frame is available!')
+                    self.get_logger().info(f'  {self.camera_frame} → ... → {self.fallback_frame}')
+                    self.get_logger().info(f'  (Still waiting for {self.map_frame} frame...)')
+            else:
+                # List available frames for debugging
+                if not self.transform_available:
+                    frames = self.tf_buffer.all_frames_as_yaml()
+                    if frames:
+                        self.get_logger().debug(f'Available frames: {frames}')
+        except Exception as e:
+            self.get_logger().debug(f'TF check error: {e}')
 
     def depth_callback(self, msg):
         try:
@@ -141,7 +188,7 @@ class HorizontalCylinderDetector(Node):
             timestamp: ROS timestamp for the transformation
             
         Returns:
-            PointStamped in map frame, or None if transformation fails
+            PointStamped in map frame (or odom frame as fallback), or None if transformation fails
         """
         # Create PointStamped in camera frame
         point_cam = PointStamped()
@@ -151,14 +198,56 @@ class HorizontalCylinderDetector(Node):
         point_cam.point.y = y_cam
         point_cam.point.z = z_cam
         
+        # Determine target frame
+        target_frame = self.map_frame
+        
         try:
-            # Transform to map frame
-            # Using a small timeout to get the latest available transform
-            point_map = self.tf_buffer.transform(point_cam, self.map_frame, timeout=rclpy.duration.Duration(seconds=0.1))
-            return point_map
+            # First, check if the transform to map exists
+            if not self.tf_buffer.can_transform(self.map_frame, self.camera_frame, rclpy.time.Time()):
+                # Try fallback frame (odom) if enabled
+                if self.use_fallback and self.tf_buffer.can_transform(self.fallback_frame, self.camera_frame, rclpy.time.Time()):
+                    target_frame = self.fallback_frame
+                    if not self.using_fallback:
+                        self.using_fallback = True
+                        self.get_logger().warn(f'Map frame not available, using {self.fallback_frame} frame instead')
+                else:
+                    if not self.transform_available:
+                        if self.use_fallback:
+                            self.get_logger().warn_once(f'Transform from {self.camera_frame} to {self.map_frame} or {self.fallback_frame} not available yet. Waiting...')
+                        else:
+                            self.get_logger().warn_once(f'Transform from {self.camera_frame} to {self.map_frame} not available yet. Waiting...')
+                    return None
+            else:
+                # Map is available
+                if self.using_fallback:
+                    self.using_fallback = False
+                    self.get_logger().info(f'Map frame is now available, switching from {self.fallback_frame} to {self.map_frame}')
             
+            # Mark that transform is available
+            if not self.transform_available:
+                self.transform_available = True
+                self.get_logger().info(f'Transform from {self.camera_frame} to {target_frame} is now available!')
+            
+            # Try to get transform at exact timestamp first
+            try:
+                point_transformed = self.tf_buffer.transform(point_cam, target_frame, 
+                                                            timeout=rclpy.duration.Duration(seconds=0.1))
+                # Update header to indicate which frame we're actually using
+                if target_frame != self.map_frame:
+                    point_transformed.header.frame_id = target_frame
+                return point_transformed
+            except TransformException:
+                # If exact timestamp fails, try with latest available transform
+                self.get_logger().debug('Exact timestamp transform failed, using latest available')
+                point_cam.header.stamp = rclpy.time.Time()  # Time(0) means "latest available"
+                point_transformed = self.tf_buffer.transform(point_cam, target_frame, 
+                                                            timeout=rclpy.duration.Duration(seconds=0.1))
+                if target_frame != self.map_frame:
+                    point_transformed.header.frame_id = target_frame
+                return point_transformed
+                
         except TransformException as ex:
-            self.get_logger().warn(f'Could not transform from {self.camera_frame} to {self.map_frame}: {ex}')
+            self.get_logger().warn(f'Could not transform from {self.camera_frame} to {target_frame}: {ex}')
             return None
 
     def image_callback(self, msg):
@@ -293,14 +382,15 @@ class HorizontalCylinderDetector(Node):
                         # Publish to tree_pos topic
                         self.tree_pos_pub.publish(point_map)
                         
-                        # Log the map frame coordinates
+                        # Log the transformed coordinates
+                        frame_name = point_map.header.frame_id
                         self.get_logger().info(
-                            f"Cylinder {i+1} in map frame: "
+                            f"Cylinder {i+1} in {frame_name} frame: "
                             f"X={point_map.point.x:.3f}m, Y={point_map.point.y:.3f}m, Z={point_map.point.z:.3f}m"
                         )
                         
-                        # Add map frame info to visualization
-                        map_coord_str = f"Map: ({point_map.point.x:.2f}, {point_map.point.y:.2f}, {point_map.point.z:.2f})m"
+                        # Add transformed frame info to visualization
+                        map_coord_str = f"{frame_name}: ({point_map.point.x:.2f}, {point_map.point.y:.2f}, {point_map.point.z:.2f})m"
                         cv2.putText(debug_image, map_coord_str, (x, y + h + 75), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 128, 0), 2)
                     
