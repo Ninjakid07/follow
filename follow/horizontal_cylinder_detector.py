@@ -73,6 +73,7 @@ class HorizontalCylinderDetector(Node):
         # Track if we've successfully transformed before
         self.transform_available = False
         self.using_fallback = False
+        self.warned_no_transform = False
 
         # Subscribers
         self.image_sub = self.create_subscription(
@@ -211,11 +212,12 @@ class HorizontalCylinderDetector(Node):
                         self.using_fallback = True
                         self.get_logger().warn(f'Map frame not available, using {self.fallback_frame} frame instead')
                 else:
-                    if not self.transform_available:
+                    if not self.transform_available and not self.warned_no_transform:
+                        self.warned_no_transform = True
                         if self.use_fallback:
-                            self.get_logger().warn_once(f'Transform from {self.camera_frame} to {self.map_frame} or {self.fallback_frame} not available yet. Waiting...')
+                            self.get_logger().warn(f'Transform from {self.camera_frame} to {self.map_frame} or {self.fallback_frame} not available yet. Waiting...')
                         else:
-                            self.get_logger().warn_once(f'Transform from {self.camera_frame} to {self.map_frame} not available yet. Waiting...')
+                            self.get_logger().warn(f'Transform from {self.camera_frame} to {self.map_frame} not available yet. Waiting...')
                     return None
             else:
                 # Map is available
@@ -226,6 +228,7 @@ class HorizontalCylinderDetector(Node):
             # Mark that transform is available
             if not self.transform_available:
                 self.transform_available = True
+                self.warned_no_transform = False
                 self.get_logger().info(f'Transform from {self.camera_frame} to {target_frame} is now available!')
             
             # Try to get transform at exact timestamp first
