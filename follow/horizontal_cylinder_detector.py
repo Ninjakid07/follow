@@ -3,10 +3,18 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
+from geometry_msgs.msg import PointStamped
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
 import math
+
+# TF2 imports
+import tf2_ros
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+import tf2_geometry_msgs
 
 # =====================================================================================
 # --- TUNING PARAMETERS ---
@@ -41,7 +49,16 @@ class HorizontalCylinderDetector(Node):
         self.fy = None
         self.cx = None
         self.cy = None
+        
+        # TF2 setup
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        # Frame names
+        self.camera_frame = 'oak_camera_rgb_camera_optical_frame'
+        self.map_frame = 'map'
 
+        # Subscribers
         self.image_sub = self.create_subscription(
             CompressedImage,
             '/oak/rgb/image_rect/compressed',
@@ -54,17 +71,21 @@ class HorizontalCylinderDetector(Node):
             self.depth_callback,
             10)
         
-        # NEW: Subscribe to camera info for intrinsics
         self.camera_info_sub = self.create_subscription(
             CameraInfo,
             '/oak/rgb/camera_info',
             self.camera_info_callback,
             10)
         
+        # Publishers
         self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 10)
+        
+        # NEW: Publisher for tree positions in map frame
+        self.tree_pos_pub = self.create_publisher(PointStamped, 'tree_pos', 10)
         
         self.get_logger().info('Cylinder Detector (Contour Splitting) has started.')
         self.get_logger().info('Waiting for camera intrinsics...')
+        self.get_logger().info(f'Will transform from {self.camera_frame} to {self.map_frame}')
 
     def camera_info_callback(self, msg):
         """Extract camera intrinsics from CameraInfo message"""
@@ -110,6 +131,35 @@ class HorizontalCylinderDetector(Node):
         Z = depth_meters
         
         return X, Y, Z
+    
+    def transform_point_to_map(self, x_cam, y_cam, z_cam, timestamp):
+        """
+        Transform a 3D point from camera frame to map frame
+        
+        Args:
+            x_cam, y_cam, z_cam: 3D coordinates in camera frame
+            timestamp: ROS timestamp for the transformation
+            
+        Returns:
+            PointStamped in map frame, or None if transformation fails
+        """
+        # Create PointStamped in camera frame
+        point_cam = PointStamped()
+        point_cam.header.frame_id = self.camera_frame
+        point_cam.header.stamp = timestamp
+        point_cam.point.x = x_cam
+        point_cam.point.y = y_cam
+        point_cam.point.z = z_cam
+        
+        try:
+            # Transform to map frame
+            # Using a small timeout to get the latest available transform
+            point_map = self.tf_buffer.transform(point_cam, self.map_frame, timeout=rclpy.duration.Duration(seconds=0.1))
+            return point_map
+            
+        except TransformException as ex:
+            self.get_logger().warn(f'Could not transform from {self.camera_frame} to {self.map_frame}: {ex}')
+            return None
 
     def image_callback(self, msg):
         # Check if we have both depth image and camera intrinsics
@@ -126,6 +176,9 @@ class HorizontalCylinderDetector(Node):
             self.get_logger().error(f'Failed to convert color image: {e}')
             return
         debug_image = cv_image.copy()
+        
+        # Get timestamp for TF lookups
+        timestamp = msg.header.stamp
 
         # Step 1: Create a clean mask of the red areas
         hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
@@ -218,24 +271,42 @@ class HorizontalCylinderDetector(Node):
                 depth_meters = median_depth_mm / 1000.0
                 depth_str = f"Depth: {depth_meters:.2f}m"
                 
-                # NEW: Calculate 3D coordinates if we have camera intrinsics
+                # Calculate 3D coordinates if we have camera intrinsics
                 if self.camera_intrinsics is not None:
                     # Use the center of the sampling region as the measurement point
                     u = sample_x + sample_w // 2
                     v = sample_y + sample_h // 2
                     
-                    # Unproject to 3D
-                    X, Y, Z = self.unproject_pixel_to_3d(u, v, depth_meters)
+                    # Unproject to 3D in camera frame
+                    X_cam, Y_cam, Z_cam = self.unproject_pixel_to_3d(u, v, depth_meters)
                     
-                    # Log the 3D coordinates
+                    # Log the camera frame coordinates
                     self.get_logger().info(
                         f"Cylinder {i+1} in camera frame: "
-                        f"X={X:.3f}m, Y={Y:.3f}m, Z={Z:.3f}m"
+                        f"X={X_cam:.3f}m, Y={Y_cam:.3f}m, Z={Z_cam:.3f}m"
                     )
                     
-                    # Add 3D info to the visualization
-                    coord_str = f"3D: ({X:.2f}, {Y:.2f}, {Z:.2f})m"
-                    cv2.putText(debug_image, coord_str, (x, y + h + 50), 
+                    # Transform to map frame and publish
+                    point_map = self.transform_point_to_map(X_cam, Y_cam, Z_cam, timestamp)
+                    
+                    if point_map is not None:
+                        # Publish to tree_pos topic
+                        self.tree_pos_pub.publish(point_map)
+                        
+                        # Log the map frame coordinates
+                        self.get_logger().info(
+                            f"Cylinder {i+1} in map frame: "
+                            f"X={point_map.point.x:.3f}m, Y={point_map.point.y:.3f}m, Z={point_map.point.z:.3f}m"
+                        )
+                        
+                        # Add map frame info to visualization
+                        map_coord_str = f"Map: ({point_map.point.x:.2f}, {point_map.point.y:.2f}, {point_map.point.z:.2f})m"
+                        cv2.putText(debug_image, map_coord_str, (x, y + h + 75), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 128, 0), 2)
+                    
+                    # Add camera frame 3D info to the visualization
+                    cam_coord_str = f"Cam: ({X_cam:.2f}, {Y_cam:.2f}, {Z_cam:.2f})m"
+                    cv2.putText(debug_image, cam_coord_str, (x, y + h + 50), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (36, 255, 12), 2)
 
             # Draw the final bounding box and label
