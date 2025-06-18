@@ -1,160 +1,262 @@
-# horizontal_cylinder_detector.py (FINAL - With Transform Wait)
+# horizontal_cylinder_detector.py (Contour Splitting with Convexity Defects)
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
-from geometry_msgs.msg import Point, PointStamped
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
-import tf2_ros
-import tf2_geometry_msgs
+import math
 
 # =====================================================================================
-# --- TUNING PARAMETERS (Unchanged) ---
-LOWER_RED_1 = np.array([0, 120, 70]); UPPER_RED_1 = np.array([10, 255, 255])
-LOWER_RED_2 = np.array([165, 120, 70]); UPPER_RED_2 = np.array([180, 255, 255])
-MIN_EDGE_CONTOUR_LENGTH = 30; MAX_HORIZONTAL_DEVIATION_PX = 40
-MAX_DEPTH_DIFFERENCE_MM = 150; MIN_VERTICAL_SEPARATION_PX = 50
+# --- TUNING PARAMETERS ---
+# =====================================================================================
+LOWER_RED_1 = np.array([0, 120, 70])
+UPPER_RED_1 = np.array([10, 255, 255])
+LOWER_RED_2 = np.array([165, 120, 70])
+UPPER_RED_2 = np.array([180, 255, 255])
+
+# --- Blob Filtering ---
+MIN_BLOB_AREA = 2000 # A contour must have at least this many pixels to be a cylinder.
+
+# --- Depth Sampling ---
+DEPTH_SAMPLE_PERCENT = 0.5 
+
+# --- Convexity Defect / Splitting Logic ---
+# The "valley" between cylinders must be at least this deep (in pixels) to be considered a valid split point.
+MIN_DEFECT_DEPTH = 20 
+# The angle at the "valley" point must be sharp (less than 90 degrees) to be a split point.
+MAX_DEFECT_ANGLE_DEG = 90
 # =====================================================================================
 
-class CylinderDetector(Node):
+class HorizontalCylinderDetector(Node):
     def __init__(self):
-        super().__init__('cylinder_detector')
-        # ... (all __init__ contents are the same as before) ...
+        super().__init__('horizontal_cylinder_detector')
         self.bridge = CvBridge()
         self.latest_depth_image = None
+        
+        # Camera intrinsics storage
         self.camera_intrinsics = None
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.image_sub = self.create_subscription(
-            CompressedImage, '/oak/rgb/image_rect/compressed', self.image_callback, 10)
-        self.depth_sub = self.create_subscription(
-            Image, '/oak/stereo/image_raw', self.depth_callback, 10)
-        self.info_sub = self.create_subscription(
-            CameraInfo, '/oak/rgb/camera_info', self.info_callback, 10)
-        self.tree_pos_pub = self.create_publisher(PointStamped, '/tree_pos', 10)
-        self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 10)
-        self.get_logger().info('Cylinder Detector (Publish Nearest) has started.')
+        self.fx = None
+        self.fy = None
+        self.cx = None
+        self.cy = None
 
-    def info_callback(self, msg):
+        self.image_sub = self.create_subscription(
+            CompressedImage,
+            '/oak/rgb/image_rect/compressed',
+            self.image_callback,
+            10)
+        
+        self.depth_sub = self.create_subscription(
+            Image,
+            '/oak/stereo/image_raw', 
+            self.depth_callback,
+            10)
+        
+        # NEW: Subscribe to camera info for intrinsics
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo,
+            '/oak/rgb/camera_info',
+            self.camera_info_callback,
+            10)
+        
+        self.debug_image_pub = self.create_publisher(Image, '~/debug_image', 10)
+        
+        self.get_logger().info('Cylinder Detector (Contour Splitting) has started.')
+        self.get_logger().info('Waiting for camera intrinsics...')
+
+    def camera_info_callback(self, msg):
+        """Extract camera intrinsics from CameraInfo message"""
         if self.camera_intrinsics is None:
-            self.camera_intrinsics = msg
-            self.get_logger().info('Camera intrinsics received.')
-            self.destroy_subscription(self.info_sub)
+            # Extract K matrix (3x3 intrinsic matrix stored as 1D array)
+            # K = [fx  0  cx]
+            #     [ 0  fy cy]
+            #     [ 0  0  1 ]
+            K = np.array(msg.k).reshape(3, 3)
+            
+            self.fx = K[0, 0]  # Focal length in x
+            self.fy = K[1, 1]  # Focal length in y
+            self.cx = K[0, 2]  # Principal point x
+            self.cy = K[1, 2]  # Principal point y
+            
+            self.camera_intrinsics = K
+            
+            self.get_logger().info(f'Camera intrinsics received:')
+            self.get_logger().info(f'  fx: {self.fx:.2f}, fy: {self.fy:.2f}')
+            self.get_logger().info(f'  cx: {self.cx:.2f}, cy: {self.cy:.2f}')
 
     def depth_callback(self, msg):
-        self.latest_depth_image = self.bridge.imgmsg_to_cv2(msg, 'passthrough')
+        try:
+            self.latest_depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as e:
+            self.get_logger().error(f'Failed to convert depth image: {e}')
+
+    def unproject_pixel_to_3d(self, u, v, depth_meters):
+        """
+        Convert 2D pixel coordinates to 3D camera coordinates
+        
+        Args:
+            u: pixel x-coordinate
+            v: pixel y-coordinate
+            depth_meters: depth value in meters
+            
+        Returns:
+            (X, Y, Z) in camera frame (meters)
+        """
+        # Apply the unprojection formula
+        X = (u - self.cx) / self.fx * depth_meters
+        Y = (v - self.cy) / self.fy * depth_meters
+        Z = depth_meters
+        
+        return X, Y, Z
 
     def image_callback(self, msg):
-        if self.latest_depth_image is None or self.camera_intrinsics is None: return
-
-        # --- Detection logic (unchanged) ---
-        # ... (The entire, long block of detection code is identical) ...
-        cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, 'bgr8')
-        if cv_image.shape[:2] != self.latest_depth_image.shape[:2]: return
-        hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-        mask1 = cv2.inRange(hsv_image, LOWER_RED_1, UPPER_RED_1); mask2 = cv2.inRange(hsv_image, LOWER_RED_2, UPPER_RED_2)
-        red_mask = cv2.bitwise_or(mask1, mask2)
-        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((5,5),np.uint8)); red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((7,7),np.uint8))
-        h, w = red_mask.shape
-        top_edge_image = np.zeros_like(red_mask); bottom_edge_image = np.zeros_like(red_mask)
-        cols_with_red = np.where(red_mask.max(axis=0) > 0)[0]
-        if cols_with_red.size == 0: self.debug_image_pub.publish(self.bridge.cv2_to_imgmsg(cv_image, 'bgr8')); return
-        top_indices = np.argmax(red_mask, axis=0)[cols_with_red]; bottom_indices = h - 1 - np.argmax(np.flipud(red_mask), axis=0)[cols_with_red]
-        top_edge_image[top_indices, cols_with_red] = 255; bottom_edge_image[bottom_indices, cols_with_red] = 255
-        top_contours, _ = cv2.findContours(top_edge_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        bottom_contours, _ = cv2.findContours(bottom_edge_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        top_edges = [c for c in top_contours if cv2.arcLength(c, False) > MIN_EDGE_CONTOUR_LENGTH]
-        bottom_edges = [c for c in bottom_contours if cv2.arcLength(c, False) > MIN_EDGE_CONTOUR_LENGTH]
-        detected_cylinders = []; available_bottom_edges = list(bottom_edges)
-        for top_c in top_edges:
-            x_top, y_top, w_top, h_top = cv2.boundingRect(top_c)
-            cx_top = x_top + w_top // 2; cy_top = y_top + h_top // 2
-            top_mask = np.zeros_like(red_mask); cv2.drawContours(top_mask, [top_c], -1, 255, thickness=5)
-            top_depths = self.latest_depth_image[top_mask == 255]; top_depths = top_depths[top_depths > 0]
-            if top_depths.size == 0: continue
-            avg_depth_top = np.mean(top_depths)
-            best_match = None; best_match_idx = -1; best_match_score = float('inf')
-            for i, bottom_c in enumerate(available_bottom_edges):
-                x_bot, y_bot, w_bot, h_bot = cv2.boundingRect(bottom_c)
-                cx_bottom = x_bot + w_bot // 2; cy_bottom = y_bot + h_bot // 2
-                if cy_bottom <= cy_top + MIN_VERTICAL_SEPARATION_PX: continue
-                bottom_mask = np.zeros_like(red_mask); cv2.drawContours(bottom_mask, [bottom_c], -1, 255, thickness=5)
-                bottom_depths = self.latest_depth_image[bottom_mask == 255]; bottom_depths = bottom_depths[bottom_depths > 0]
-                if bottom_depths.size == 0: continue
-                avg_depth_bottom = np.mean(bottom_depths)
-                if abs(avg_depth_top - avg_depth_bottom) > MAX_DEPTH_DIFFERENCE_MM: continue
-                horizontal_diff = abs(cx_top - cx_bottom)
-                if horizontal_diff >= MAX_HORIZONTAL_DEVIATION_PX: continue
-                if horizontal_diff < best_match_score:
-                    best_match_score = horizontal_diff; best_match = (bottom_c, avg_depth_bottom); best_match_idx = i
-            if best_match is not None:
-                matched_bottom_c, avg_depth_bottom = best_match
-                x_bot_match, y_bot_match, w_bot_match, h_bot_match = cv2.boundingRect(matched_bottom_c)
-                x_full = min(x_top, x_bot_match); y_full = y_top
-                w_full = max(x_top + w_top, x_bot_match + w_bot_match) - x_full
-                h_full = (y_bot_match + h_bot_match) - y_top
-                avg_depth_cylinder = (avg_depth_top + avg_depth_bottom) / 2.0
-                detected_cylinders.append({'rect': (x_full, y_full, w_full, h_full), 'depth': avg_depth_cylinder})
-                available_bottom_edges.pop(best_match_idx)
-        
-        if not detected_cylinders: return
-        nearest_cylinder = min(detected_cylinders, key=lambda c: c['depth'])
-
-        # --- 3D Calculation and Publishing (with THE FIX) ---
-        target_frame = 'map'
-        source_frame = 'oak_rgb_camera_optical_frame'
-        
-        # --- NEW: Wait for the transform to be available ---
-        # This check prevents the warning by making sure the transform exists before we ask for it.
-        try:
-            when = rclpy.time.Time()
-            if not self.tf_buffer.can_transform(target_frame, source_frame, when, timeout=rclpy.duration.Duration(seconds=0.1)):
-                self.get_logger().warn(f"Waiting for transform from '{source_frame}' to '{target_frame}'...", throttle_duration_sec=1.0)
-                return
-        except tf2_ros.TransformException as e:
-            self.get_logger().warn(f"can_transform failed: {e}")
+        # Check if we have both depth image and camera intrinsics
+        if self.latest_depth_image is None:
             return
         
-        # Now we know the transform exists, so we can safely calculate and publish
-        rect = nearest_cylinder['rect']; depth_mm = nearest_cylinder['depth']
-        fx = self.camera_intrinsics.k[0]; fy = self.camera_intrinsics.k[4]
-        cx = self.camera_intrinsics.k[2]; cy = self.camera_intrinsics.k[5]
-        pixel_x = rect[0] + rect[2] / 2; pixel_y = rect[1] + rect[3] / 2
-        depth_m = depth_mm / 1000.0
-        x_cam = (pixel_x - cx) * depth_m / fx
-        y_cam = (pixel_y - cy) * depth_m / fy
-        z_cam = depth_m
-
-        point_in_camera_frame = PointStamped()
-        point_in_camera_frame.header.stamp = msg.header.stamp
-        point_in_camera_frame.header.frame_id = source_frame
-        point_in_camera_frame.point = Point(x=x_cam, y=y_cam, z=z_cam)
-
+        if self.camera_intrinsics is None:
+            self.get_logger().warn_once('Camera intrinsics not yet received. Cannot compute 3D coordinates.')
+            # Continue with detection but without 3D coordinates
+            
         try:
-            point_in_map_frame = self.tf_buffer.transform(point_in_camera_frame, target_frame)
-            self.tree_pos_pub.publish(point_in_map_frame)
-            self.get_logger().info(f'Published nearest cylinder at map coordinates: x={point_in_map_frame.point.x:.2f}, y={point_in_map_frame.point.y:.2f}')
-        except tf2_ros.TransformException as e:
-            self.get_logger().warn(f"Could not transform point: {e}")
-        
-        # --- Visualization ---
+            cv_image = self.bridge.compressed_imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f'Failed to convert color image: {e}')
+            return
         debug_image = cv_image.copy()
-        x, y, w, h = nearest_cylinder['rect']
-        avg_depth_m = nearest_cylinder['depth'] / 1000.0
-        label = f"Nearest @ {avg_depth_m:.2f}m"
-        cv2.rectangle(debug_image, (x, y), (x + w, y + h), (36, 255, 12), 3)
-        cv2.putText(debug_image, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
+
+        # Step 1: Create a clean mask of the red areas
+        hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+        mask1 = cv2.inRange(hsv_image, LOWER_RED_1, UPPER_RED_1)
+        mask2 = cv2.inRange(hsv_image, LOWER_RED_2, UPPER_RED_2)
+        red_mask = cv2.bitwise_or(mask1, mask2)
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((5,5),np.uint8))
+        red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((15,15),np.uint8))
+
+        # Step 2: Find all the distinct blobs (contours) in the mask
+        contours, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        final_bounding_boxes = []
+
+        for c in contours:
+            # Step 2a: Filter out small, noisy blobs
+            if cv2.contourArea(c) < MIN_BLOB_AREA:
+                continue
+
+            # Step 3: Calculate the Convex Hull and Convexity Defects
+            # The hull is the "rubber band" stretched around the blob.
+            # Defects are the "valleys" where the blob deviates inwards from the hull.
+            hull = cv2.convexHull(c, returnPoints=False)
+            if len(hull) > 3 and len(c) > 3: # Need enough points to calculate defects
+                defects = cv2.convexityDefects(c, hull)
+            else:
+                defects = None
+
+            # Visualize the contour and hull for debugging
+            cv2.drawContours(debug_image, [c], -1, (0, 0, 255), 2) # Red contour
+            hull_points = [c[i][0] for i in hull]
+            hull_points = np.array(hull_points, dtype=np.int32)
+            cv2.drawContours(debug_image, [hull_points], -1, (255, 0, 0), 2) # Blue hull
+
+            split_points = []
+            if defects is not None:
+                # Step 4: Analyze the defects to find valid split points
+                for i in range(defects.shape[0]):
+                    s, e, f, d = defects[i, 0]
+                    start = tuple(c[s][0])
+                    end = tuple(c[e][0])
+                    far = tuple(c[f][0]) # This is the deepest point of the "valley"
+
+                    # Calculate the angle of the defect
+                    a = math.sqrt((end[0] - start[0])**2 + (end[1] - start[1])**2)
+                    b = math.sqrt((far[0] - start[0])**2 + (far[1] - start[1])**2)
+                    c_side = math.sqrt((end[0] - far[0])**2 + (end[1] - far[1])**2)
+                    angle = math.acos((b**2 + c_side**2 - a**2) / (2 * b * c_side))
+
+                    # If the valley is deep enough and the angle is sharp enough, it's a split point
+                    if d > MIN_DEFECT_DEPTH * 256 and angle < math.radians(MAX_DEFECT_ANGLE_DEG):
+                        split_points.append(far)
+                        cv2.circle(debug_image, far, 5, [0, 255, 0], -1) # Green circle on split point
+
+            # Step 5: Split the main bounding box based on the found split points
+            x, y, w, h = cv2.boundingRect(c)
+            
+            # Get the x-coordinates of the blob's left edge, right edge, and all split points
+            boundary_xs = [x] + [pt[0] for pt in split_points] + [x + w]
+            boundary_xs = sorted(list(set(boundary_xs))) # Sort and remove duplicates
+
+            # Create new bounding boxes between each boundary point
+            for i in range(len(boundary_xs) - 1):
+                x1 = boundary_xs[i]
+                x2 = boundary_xs[i+1]
+                # A new bounding box is the full height of the original blob,
+                # but sliced vertically at the split points.
+                new_box = (x1, y, x2 - x1, h)
+                final_bounding_boxes.append(new_box)
+        
+        self.get_logger().info(f"Detected {len(final_bounding_boxes)} cylinders.")
+
+        # Step 6: Process the final list of bounding boxes (calculate depth, visualize, and 3D coordinates)
+        for i, (x, y, w, h) in enumerate(final_bounding_boxes):
+            # Define a central sampling area for robust depth
+            sample_w = int(w * DEPTH_SAMPLE_PERCENT)
+            sample_h = int(h * DEPTH_SAMPLE_PERCENT)
+            sample_x = x + (w - sample_w) // 2
+            sample_y = y + (h - sample_h) // 2
+            
+            # Get all depth pixels from the sampling area
+            depth_roi = self.latest_depth_image[sample_y : sample_y + sample_h, sample_x : sample_x + sample_w]
+            valid_depths = depth_roi[depth_roi > 0]
+
+            if valid_depths.size == 0:
+                depth_str = "Depth: N/A"
+                self.get_logger().warn(f"Cylinder {i+1}: No valid depth data")
+            else:
+                median_depth_mm = np.median(valid_depths)
+                depth_meters = median_depth_mm / 1000.0
+                depth_str = f"Depth: {depth_meters:.2f}m"
+                
+                # NEW: Calculate 3D coordinates if we have camera intrinsics
+                if self.camera_intrinsics is not None:
+                    # Use the center of the sampling region as the measurement point
+                    u = sample_x + sample_w // 2
+                    v = sample_y + sample_h // 2
+                    
+                    # Unproject to 3D
+                    X, Y, Z = self.unproject_pixel_to_3d(u, v, depth_meters)
+                    
+                    # Log the 3D coordinates
+                    self.get_logger().info(
+                        f"Cylinder {i+1} in camera frame: "
+                        f"X={X:.3f}m, Y={Y:.3f}m, Z={Z:.3f}m"
+                    )
+                    
+                    # Add 3D info to the visualization
+                    coord_str = f"3D: ({X:.2f}, {Y:.2f}, {Z:.2f})m"
+                    cv2.putText(debug_image, coord_str, (x, y + h + 50), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (36, 255, 12), 2)
+
+            # Draw the final bounding box and label
+            label = f"Cylinder {i+1}"
+            cv2.rectangle(debug_image, (x, y), (x + w, y + h), (36, 255, 12), 3)
+            cv2.putText(debug_image, label, (x, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (36, 255, 12), 2)
+            cv2.putText(debug_image, depth_str, (x, y + h + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (36, 255, 12), 2)
+        
+        # Publish and show images
         self.debug_image_pub.publish(self.bridge.cv2_to_imgmsg(debug_image, 'bgr8'))
         cv2.imshow("Detection Result", debug_image)
         cv2.waitKey(1)
 
+
 def main(args=None):
     rclpy.init(args=args)
-    detector_node = CylinderDetector()
-    try: rclpy.spin(detector_node)
-    except KeyboardInterrupt: pass
+    detector_node = HorizontalCylinderDetector()
+    try:
+        rclpy.spin(detector_node)
+    except KeyboardInterrupt:
+        pass
     finally:
         detector_node.destroy_node()
         rclpy.shutdown()
