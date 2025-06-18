@@ -244,10 +244,16 @@ class HorizontalCylinderDetector(Node):
             cv2.putText(debug_image, label, (x, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (36, 255, 12), 2)
             cv2.putText(debug_image, depth_str, (x, y + h + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (36, 255, 12), 2)
         
-        # Publish and show images
+        # Publish the debug image
         self.debug_image_pub.publish(self.bridge.cv2_to_imgmsg(debug_image, 'bgr8'))
-        cv2.imshow("Detection Result", debug_image)
-        cv2.waitKey(1)
+        
+        # Only show window if display is available
+        try:
+            cv2.imshow("Detection Result", debug_image)
+            cv2.waitKey(1)
+        except cv2.error as e:
+            # Silently ignore if no display is available
+            pass
 
 
 def main(args=None):
@@ -260,7 +266,10 @@ def main(args=None):
     finally:
         detector_node.destroy_node()
         rclpy.shutdown()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
 
 if __name__ == '__main__':
     main()
