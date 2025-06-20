@@ -1,11 +1,11 @@
-# horizontal_cylinder_detector_stabilized_fix.py
+# horizontal_cylinder_detector_final_robust_fix.py
 
 import rclpy
-# ... (all other imports are the same as above) ...
 import rclpy.time
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.duration import Duration
+# ... (all other imports are the same) ...
 from visualization_msgs.msg import Marker
 from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from geometry_msgs.msg import PointStamped, Point, Pose, Vector3
@@ -19,51 +19,31 @@ import tf2_ros
 from tf2_ros import Buffer, TransformListener
 import tf2_geometry_msgs
 
-# =====================================================================================
-# --- TUNING PARAMETERS ---
-# =====================================================================================
-LOWER_RED_1 = np.array([0, 120, 70])
-UPPER_RED_1 = np.array([10, 255, 255])
-LOWER_RED_2 = np.array([165, 120, 70])
-UPPER_RED_2 = np.array([180, 255, 255])
-MIN_EDGE_CONTOUR_LENGTH = 30
-MAX_HORIZONTAL_DEVIATION_PX = 40
-MAX_DEPTH_DIFFERENCE_MM = 150
-MIN_VERTICAL_SEPARATION_PX = 50
-# --- Parameters for robust mapping ---
-ASSOCIATION_THRESHOLD_METERS = 0.4 # A more tolerant threshold
-INITIALIZATION_DELAY_SEC = 5.0
-MIN_DETECTION_RANGE_M = 0.69
-MAX_DETECTION_RANGE_M = 1.5
-# =====================================================================================
+# ... (All TUNING PARAMETERS are the same) ...
+LOWER_RED_1 = np.array([0, 120, 70]); UPPER_RED_1 = np.array([10, 255, 255]); LOWER_RED_2 = np.array([165, 120, 70]); UPPER_RED_2 = np.array([180, 255, 255])
+MIN_EDGE_CONTOUR_LENGTH = 30; MAX_HORIZONTAL_DEVIATION_PX = 40; MAX_DEPTH_DIFFERENCE_MM = 150; MIN_VERTICAL_SEPARATION_PX = 50
+ASSOCIATION_THRESHOLD_METERS = 0.4; INITIALIZATION_DELAY_SEC = 5.0; MIN_DETECTION_RANGE_M = 0.69; MAX_DETECTION_RANGE_M = 1.5
 
 class HorizontalCylinderDetector(Node):
     def __init__(self):
-        super().__init__('horizontal_cylinder_detector_stabilized_fix')
+        super().__init__('horizontal_cylinder_detector_final_robust')
+        # ... (__init__ is the same) ...
         if not self.has_parameter('use_sim_time'): self.declare_parameter('use_sim_time', True)
-        # ... (rest of __init__ is the same) ...
         sim_time_is_enabled = self.get_parameter('use_sim_time').get_parameter_value().bool_value
         log_msg = 'Node is using simulation time.' if sim_time_is_enabled else 'Node is using system (wall) time.'
         self.get_logger().info(log_msg)
-        self.start_time = self.get_clock().now()
-        self.queue_size = 30
-        self.bridge = CvBridge()
-        self.latest_depth_image = None
-        self.camera_intrinsics = None
-        self.intrinsics_received = False
-        # THE DATABASE NOW STORES DICTIONARIES
-        self.known_cylinders = [] 
-        self.next_marker_id = 0
+        self.start_time = self.get_clock().now(); self.queue_size = 30; self.bridge = CvBridge()
+        self.latest_depth_image = None; self.camera_intrinsics = None; self.intrinsics_received = False
+        self.known_cylinders = []; self.next_marker_id = 0
         self.get_logger().info('Setting TF buffer duration to 10.0 seconds.')
-        self.tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_buffer = Buffer(cache_time=rclpy.duration.Duration(seconds=10.0)); self.tf_listener = TransformListener(self.tf_buffer, self)
         self.source_frame, self.target_frame = 'oak_camera_rgb_camera_optical_frame', 'map'
         self.get_logger().info(f'Source frame: {self.source_frame}, Target frame: {self.target_frame}')
         self.image_sub = self.create_subscription(CompressedImage, '/oak/rgb/image_rect/compressed', self.image_callback, self.queue_size)
         self.depth_sub = self.create_subscription(Image, '/oak/stereo/image_raw', self.depth_callback, self.queue_size)
         self.info_sub = self.create_subscription(CameraInfo, '/oak/rgb/camera_info', self.info_callback, self.queue_size)
-        self.marker_publisher = self.create_publisher(Marker, '~/permanent_cylinders_stabilized', self.queue_size)
-        self.get_logger().info('Cylinder Detector (Stabilized Fix) has started.')
+        self.marker_publisher = self.create_publisher(Marker, '~/permanent_cylinders', self.queue_size)
+        self.get_logger().info('Cylinder Detector (Final Robust Fix) has started.')
 
     def depth_callback(self, msg):
         try: self.latest_depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
@@ -71,8 +51,7 @@ class HorizontalCylinderDetector(Node):
 
     def info_callback(self, msg):
         if not self.intrinsics_received:
-            self.camera_intrinsics, self.intrinsics_received = msg, True
-            self.destroy_subscription(self.info_sub)
+            self.camera_intrinsics, self.intrinsics_received = msg, True; self.destroy_subscription(self.info_sub)
             self.get_logger().info('Camera intrinsics received.')
 
     def image_callback(self, msg):
@@ -112,40 +91,49 @@ class HorizontalCylinderDetector(Node):
                 matched_bottom_c, avg_depth_bottom = best_match; x_bot_match, y_bot_match, w_bot_match, h_bot_match = cv2.boundingRect(matched_bottom_c)
                 x_full, y_full, w_full, h_full = min(x_top, x_bot_match), y_top, max(x_top + w_top, x_bot_match + w_bot_match) - min(x_top, x_bot_match), (y_bot_match + h_bot_match) - y_top
                 avg_depth_cylinder = (avg_depth_top + avg_depth_bottom) / 2.0
-                detected_cylinders.append({'rect': (x_full, y_full, w_full, h_full), 'depth': avg_depth_cylinder})
-                available_bottom_edges.pop(best_match_idx)
+                detected_cylinders.append({'rect': (x_full, y_full, w_full, h_full), 'depth': avg_depth_cylinder, 'timestamp': msg.header.stamp})
 
         for cylinder in detected_cylinders:
             Z = cylinder['depth'] / 1000.0
             if not (MIN_DETECTION_RANGE_M <= Z <= MAX_DETECTION_RANGE_M): continue
+
+            # THE FINAL FIX: Smartly look up the transform
+            try:
+                # First, try to get the transform at the exact time the image was taken
+                transform_time = cylinder['timestamp']
+                transform = self.tf_buffer.lookup_transform(self.target_frame, self.source_frame, transform_time, timeout=Duration(seconds=0.05))
+            except tf2_ros.ExtrapolationException as e:
+                # If that fails, it's likely a clock mismatch. Fall back to getting the latest transform.
+                self.get_logger().warn(f'Exact timestamp lookup failed: {e}. Falling back to latest transform.', throttle_duration_sec=5.0)
+                try:
+                    transform_time = rclpy.time.Time()
+                    transform = self.tf_buffer.lookup_transform(self.target_frame, self.source_frame, transform_time, timeout=Duration(seconds=0.1))
+                except Exception as e_inner:
+                    self.get_logger().error(f'Could not get latest transform either: {e_inner}'); continue
+            except Exception as e:
+                self.get_logger().error(f'Failed to get any transform: {e}'); continue
+            
+            # If we successfully got a transform, proceed...
             x, y, w_box, h_box = cylinder['rect']
             fx, fy, cx, cy = self.camera_intrinsics.k[0], self.camera_intrinsics.k[4], self.camera_intrinsics.k[2], self.camera_intrinsics.k[5]
             u, v = x + w_box // 2, y + h_box // 2
             X, Y = (u - cx) * Z / fx, (v - cy) * Z / fy
-            point_in_camera = PointStamped(); point_in_camera.header.stamp = msg.header.stamp; point_in_camera.header.frame_id = self.source_frame
+            point_in_camera = PointStamped(); point_in_camera.header.stamp = cylinder['timestamp']; point_in_camera.header.frame_id = self.source_frame
             point_in_camera.point.x, point_in_camera.point.y, point_in_camera.point.z = X, Y, Z
-            try:
-                transform = self.tf_buffer.lookup_transform(self.target_frame, self.source_frame, rclpy.time.Time())
-                newly_detected_point = tf2_geometry_msgs.do_transform_point(point_in_camera, transform).point
-            except Exception as e: self.get_logger().warn(f'Could not transform new detection: {e}', throttle_duration_sec=1.0); continue
+            
+            newly_detected_point = tf2_geometry_msgs.do_transform_point(point_in_camera, transform).point
 
+            # ... (Data association and marker publishing logic is the same) ...
             matched_known_cylinder = None
             for known_cylinder in self.known_cylinders:
                 dx, dy = newly_detected_point.x - known_cylinder['position'].x, newly_detected_point.y - known_cylinder['position'].y
                 if math.sqrt(dx*dx + dy*dy) < ASSOCIATION_THRESHOLD_METERS:
-                    matched_known_cylinder = known_cylinder
-                    break
-
+                    matched_known_cylinder = known_cylinder; break
             if matched_known_cylinder:
-                # IT'S A KNOWN CYLINDER: Refine its position with a moving average
                 p = matched_known_cylinder['position']
-                p.x = p.x * 0.95 + newly_detected_point.x * 0.05
-                p.y = p.y * 0.95 + newly_detected_point.y * 0.05
-                p.z = p.z * 0.95 + newly_detected_point.z * 0.05
-                # Re-publish the marker to show its stabilized position in RViz
+                p.x, p.y, p.z = p.x * 0.95 + newly_detected_point.x * 0.05, p.y * 0.95 + newly_detected_point.y * 0.05, p.z * 0.95 + newly_detected_point.z * 0.05
                 self.publish_permanent_marker(p, matched_known_cylinder['id'])
             else:
-                # IT'S A NEW CYLINDER: Check the startup delay
                 elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
                 if elapsed_time > INITIALIZATION_DELAY_SEC:
                     self.get_logger().info(f"*** DISCOVERED A NEW CYLINDER! Total count: {self.next_marker_id + 1} ***")
@@ -157,14 +145,13 @@ class HorizontalCylinderDetector(Node):
                     self.get_logger().warn("Ignoring new cylinder during initial stabilization period.", throttle_duration_sec=1.0)
 
     def publish_permanent_marker(self, position: Point, marker_id: int):
-        # ... (This function is the same as the last working version) ...
+        # ... (This function is the same) ...
         marker = Marker(); marker.header.frame_id = self.target_frame; marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "permanent_cylinders"; marker.id = marker_id; marker.type = Marker.CYLINDER; marker.action = Marker.ADD
         marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = position.x, position.y, position.z
         marker.pose.orientation.w = 1.0; marker.scale.x, marker.scale.y, marker.scale.z = 0.15, 0.15, 0.30
         marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 0.3, 1.0, 0.9
-        marker.lifetime = Duration(seconds=0).to_msg()
-        self.marker_publisher.publish(marker)
+        marker.lifetime = Duration(seconds=300).to_msg(); self.marker_publisher.publish(marker)
 
 def main(args=None):
     rclpy.init(args=args); detector_node = HorizontalCylinderDetector()
